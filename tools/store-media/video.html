@@ -1,0 +1,188 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Brickfall preview videos</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@700;800;900&display=swap">
+<style>body{margin:0;background:#0b0d18;color:#fff;font:16px Rubik,sans-serif;padding:16px} #game{position:fixed;left:-9999px}</style>
+</head><body>
+<canvas id="game"></canvas>
+<div id="status">starting…</div>
+<script type="module">
+import { Muxer, ArrayBufferTarget } from 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.mjs';
+import * as THREE from '/js/vendor/three.js';
+import { game } from '/js/core/state.js';
+import { settings } from '/js/core/settings.js';
+import { renderer, scene, camera, updateSky } from '/js/render/scene.js';
+import { worldMat, itemMat } from '/js/render/materials.js';
+import { raycastVoxel } from '/js/world/world.js';
+import { flushDirty } from '/js/world/mesher.js';
+import { updatePlacedBlocks } from '/js/world/placed.js';
+import { TICK } from '/js/game/physics.js';
+import { bots, createBots, player } from '/js/game/entities.js';
+import { tickBots, renderBots } from '/js/game/bots.js';
+import { tickProjectiles, renderProjectiles } from '/js/game/projectiles.js';
+import { updateEffects } from '/js/game/effects.js';
+import { drawTag } from '/js/game/characters.js';
+import { rodTip } from '/js/render/camera-rig.js';
+import { loadMode } from '/js/game/mode-loader.js';
+
+const status = (t) => { document.getElementById('status').textContent = t; };
+const FPS = 30, COVER_SECONDS = 1;
+// gameplay clips: one per mode (total with the cover: 18 s)
+const CLIPS = [
+  { mode: 'arena', seconds: 4.6, dist: 5.2, up: 2.0 },
+  { mode: 'sumo', seconds: 4.4, dist: 6, up: 2.6 },
+  { mode: 'potpvp', seconds: 4.4, dist: 5.2, up: 2.0 },
+  { mode: 'combo', seconds: 3.6, dist: 5.4, up: 2.2 },
+];
+const SIZES = { landscape: [1920, 1080], portrait: [1080, 1620] };
+
+await document.fonts.load('900 100px Rubik');
+settings.particles = 2;
+renderer.setPixelRatio(1);
+scene.fog.near = 60; scene.fog.far = 170;
+worldMat.color.setScalar(1.02); itemMat.color.setScalar(1.02);
+player.alive = false;
+
+// ------------------------------------------------------------ encoders
+async function makeEncoder(w, h) {
+  const options = [{ codec: 'avc1.640033', mux: 'avc' }, { codec: 'avc1.4d0033', mux: 'avc' }, { codec: 'vp09.00.40.08', mux: 'vp9' }];
+  for (const o of options) {
+    const config = { codec: o.codec, width: w, height: h, bitrate: 10e6, framerate: FPS };
+    if (!(await VideoEncoder.isConfigSupported(config)).supported) continue;
+    const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: o.mux, width: w, height: h, frameRate: FPS }, fastStart: 'in-memory' });
+    const enc = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: (e) => status('encoder error: ' + e.message) });
+    enc.configure(config);
+    return { enc, muxer, codec: o.codec, frame: 0, canvas: Object.assign(document.createElement('canvas'), { width: w, height: h }) };
+  }
+  throw new Error('no supported video codec');
+}
+
+const samples = [];
+async function push(v) {
+  if (v === L && v.frame % 45 === 15) samples.push(fetch(`/save?name=_frame-${String(v.frame).padStart(3, '0')}.png`, { method: 'POST', body: v.canvas.toDataURL('image/png') }));
+  if (v === P && v.frame % 90 === 15) samples.push(fetch(`/save?name=_pframe-${String(v.frame).padStart(3, '0')}.png`, { method: 'POST', body: v.canvas.toDataURL('image/png') }));
+  const vf = new VideoFrame(v.canvas, { timestamp: Math.round((v.frame * 1e6) / FPS), duration: Math.round(1e6 / FPS) });
+  v.enc.encode(vf, { keyFrame: v.frame % FPS === 0 });
+  vf.close();
+  v.frame++;
+  while (v.enc.encodeQueueSize > 4) await new Promise((r) => v.enc.addEventListener('dequeue', r, { once: true }));
+}
+
+async function finish(v, name) {
+  await v.enc.flush();
+  v.muxer.finalize();
+  const buf = v.muxer.target.buffer;
+  await fetch(`/save?name=${name}&raw=1`, { method: 'POST', body: buf });
+  return buf.byteLength;
+}
+
+const loadImg = (src) => new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; });
+
+// ------------------------------------------------------------ camera that follows a fight
+const cam = { pos: new THREE.Vector3(), look: new THREE.Vector3(), angle: 0, pair: null, ready: false };
+const _dir = new THREE.Vector3();
+
+function pickPair() {
+  let best = null, bestD = Infinity;
+  for (const b of bots) {
+    if (!b.alive || !b.target?.alive) continue;
+    const d = b.pos.distanceTo(b.target.pos);
+    if (d < bestD) { bestD = d; best = [b, b.target]; }
+  }
+  return best;
+}
+
+function clearView(from, to) {
+  _dir.subVectors(to, from);
+  const len = _dir.length();
+  _dir.divideScalar(len);
+  return !raycastVoxel(from, _dir, len);
+}
+
+function updateCam(clip) {
+  const pairOk = (p) => p && p[0].alive && p[1].alive && p[0].pos.distanceTo(p[1].pos) < 6;
+  if (!pairOk(cam.pair)) { const p = pickPair(); if (p) cam.pair = p; }
+  const [a, b] = cam.pair || [bots[0], bots[1]];
+  const mid = new THREE.Vector3().addVectors(a.model.group.position, b.model.group.position).multiplyScalar(0.5);
+  mid.y += 1.1;
+  cam.angle += 0.004;
+  // keep the full distance; if a wall is in the way, swing around to the nearest clear angle
+  let want = null;
+  for (let k = 0; k < 16 && !want; k++) {
+    const ang = cam.angle + (k % 2 ? 1 : -1) * Math.ceil(k / 2) * 0.4;
+    const p = new THREE.Vector3(mid.x + Math.cos(ang) * clip.dist, mid.y + clip.up, mid.z + Math.sin(ang) * clip.dist);
+    const crowded = bots.some((o) => o.alive && o !== a && o !== b && o.model.group.position.distanceTo(p) < 2.6);
+    if (clearView(mid, p) && !crowded) { want = p; cam.angle = ang; }
+  }
+  if (!want) want = new THREE.Vector3(mid.x, mid.y + clip.up + 3, mid.z + 1); // boxed in: look down from above
+  // first frame, or the smooth move would pass behind a wall: cut straight to the new spot
+  if (!cam.ready || !clearView(mid, cam.pos)) { cam.pos.copy(want); cam.look.copy(mid); cam.ready = true; }
+  cam.pos.lerp(want, 0.06);
+  cam.look.lerp(mid, 0.12);
+}
+
+function renderTo(v, clip) {
+  const [w, h] = [v.canvas.width, v.canvas.height];
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.fov = h > w ? 72 : 62;
+  camera.updateProjectionMatrix();
+  camera.position.copy(v.camPos);
+  camera.lookAt(v.camLook);
+  camera.rotation.z = 0;
+  updateSky(0);
+  // anyone right next to the lens would fill the screen: hide them for this frame
+  for (const b of bots) b.model.group.visible = b.alive && b.model.group.position.distanceTo(camera.position) > 2.4;
+  renderer.clear();
+  renderer.render(scene, camera);
+  for (const b of bots) b.model.group.visible = b.alive;
+  v.canvas.getContext('2d').drawImage(renderer.domElement, 0, 0);
+}
+
+// ------------------------------------------------------------ go
+const L = await makeEncoder(...SIZES.landscape), P = await makeEncoder(...SIZES.portrait);
+status(`codec ${L.codec}`);
+const coverL = await loadImg('/covers/brickfall-landscape-1920x1080.png'), coverP = await loadImg('/covers/brickfall-portrait-800x1200.png');
+
+// 1) the static cover first, so the thumbnail flows into the video
+for (let i = 0; i < COVER_SECONDS * FPS; i++) {
+  L.canvas.getContext('2d').drawImage(coverL, 0, 0, 1920, 1080);
+  P.canvas.getContext('2d').drawImage(coverP, 0, 0, 1080, 1620);
+  await push(L); await push(P);
+}
+
+// 2) gameplay, one clip per mode
+let botsMade = false;
+for (const clip of CLIPS) {
+  loadMode(clip.mode);
+  if (!botsMade) { createBots(9); botsMade = true; await document.fonts.ready; bots.forEach(drawTag); }
+  for (const b of bots) b.skill = 0.85; // sharper bots make livelier footage
+  game.state = 'menu';
+  // let the fights get going before we start filming
+  for (let i = 0; i < 20 * 7; i++) { game.time += TICK; tickBots(); tickProjectiles(TICK); updatePlacedBlocks(TICK); }
+  updateEffects(1);
+  cam.ready = false; cam.pair = null; cam.angle = Math.random() * Math.PI * 2;
+  const frames = Math.round(clip.seconds * FPS);
+  let acc = 0;
+  for (let f = 0; f < frames; f++) {
+    acc += 1 / FPS;
+    while (acc >= TICK) { game.time += TICK; tickBots(); tickProjectiles(TICK); updatePlacedBlocks(TICK); acc -= TICK; }
+    const alpha = acc / TICK;
+    flushDirty();
+    updateEffects(1 / FPS);
+    renderBots(alpha, 1 / FPS);
+    renderProjectiles(alpha, rodTip);
+    updateCam(clip); // one camera move per frame; the tall video pulls back a little
+    L.camPos = cam.pos.clone(); L.camLook = cam.look.clone();
+    P.camLook = cam.look.clone();
+    P.camPos = cam.look.clone().addScaledVector(cam.pos.clone().sub(cam.look), 1.35);
+    for (const v of [L, P]) { renderTo(v, clip); await push(v); }
+    if (f % 15 === 0) status(`${clip.mode}: frame ${f}/${frames}`);
+  }
+}
+status('encoding…');
+await Promise.all(samples);
+const sl = await finish(L, 'brickfall-preview-landscape-1920x1080.mp4');
+const sp = await finish(P, 'brickfall-preview-portrait-1080x1620.mp4');
+status(`done (${L.codec}) landscape ${(sl / 1e6).toFixed(1)} MB, portrait ${(sp / 1e6).toFixed(1)} MB, ${L.frame} frames`);
+</script>
+</body></html>

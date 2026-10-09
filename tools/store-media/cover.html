@@ -1,0 +1,229 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Brickfall covers</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@700;800;900&display=swap">
+<style>body{margin:0;background:#0b0d18;color:#fff;font:14px Rubik,sans-serif} #game{position:fixed;left:-9999px} #out img{max-width:30%;margin:6px;vertical-align:top}</style>
+</head><body>
+<canvas id="game"></canvas>
+<div id="status">rendering…</div><div id="out"></div>
+<script type="module">
+import * as THREE from '/js/vendor/three.js';
+import { renderer, scene, camera, updateSky } from '/js/render/scene.js';
+import { worldMat, itemMat } from '/js/render/materials.js';
+import { generateWorld, topY, CX, CZ, SPAWN_TOP } from '/js/world/world.js';
+import { buildAllChunks } from '/js/world/mesher.js';
+import { makeCharacter, disposeCharacter, animateCape, showHeld } from '/js/game/characters.js';
+
+await document.fonts.load('900 100px Rubik');
+renderer.setPixelRatio(1);
+scene.fog.near = 60; scene.fog.far = 170;
+worldMat.color.setScalar(1.02); itemMat.color.setScalar(1.02);
+
+let models = [];
+function clearModels() { for (const m of models) { scene.remove(m.group); disposeCharacter(m); } models = []; }
+
+/** A posed fighter. pose: 'swing' | 'run' | 'block' | 'hit' | 'idle' */
+function fighter({ skin, cape = 'none', x, z, y, face, pose = 'idle', item = 'sword', lean = 0 }) {
+  const m = makeCharacter({ skin, cape });
+  m.group.position.set(x, y ?? topY(Math.floor(x), Math.floor(z)), z);
+  m.group.rotation.y = face;
+  showHeld(m, item);
+  const P = {
+    swing: () => { m.armR.rotation.set(-2.1, 0, 0.35); m.armL.rotation.set(0.5, 0, -0.1); m.legL.rotation.x = 0.55; m.legR.rotation.x = -0.45; m.head.rotation.x = 0.1; },
+    run: () => { m.armR.rotation.set(-0.9, 0, 0.1); m.armL.rotation.set(0.8, 0, 0); m.legL.rotation.x = -0.8; m.legR.rotation.x = 0.8; },
+    block: () => { m.armR.rotation.set(-0.95, -0.55, 0.3); m.armL.rotation.set(0.2, 0, 0); m.legL.rotation.x = 0.25; m.legR.rotation.x = -0.25; },
+    hit: () => { m.armR.rotation.set(0.6, 0, 0.5); m.armL.rotation.set(0.7, 0, -0.5); m.legL.rotation.x = -0.4; m.legR.rotation.x = 0.3; m.head.rotation.x = -0.25; for (const mt of m.mats) mt.emissive.setHex(0x661111); },
+    bow: () => { m.armR.rotation.set(-Math.PI / 2, -0.1, 0); m.armL.rotation.set(-Math.PI / 2, 0.5, 0); },
+    idle: () => {},
+  };
+  P[pose]();
+  m.group.rotation.z = lean;
+  m.capeSwing = 0.75;
+  if (m.capePivot) m.capePivot.rotation.x = -0.75;
+  scene.add(m.group);
+  models.push(m);
+  return m;
+}
+
+function shot(w, h, cam) {
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.fov = cam.fov || 60;
+  camera.updateProjectionMatrix();
+  camera.position.set(...cam.pos);
+  camera.lookAt(...cam.look);
+  updateSky(0);
+  renderer.clear();
+  renderer.render(scene, camera);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(renderer.domElement, 0, 0);
+  return c;
+}
+
+/** The game's logo: white BRICK, orange FALL, chunky drop shadows. */
+function logo(g, cx, cy, size, align = 'center') {
+  g.save();
+  g.font = `900 ${size}px Rubik`;
+  g.textBaseline = 'middle';
+  const a = 'BRICK', b = 'FALL', wa = g.measureText(a).width, wb = g.measureText(b).width, total = wa + wb;
+  const x0 = align === 'center' ? cx - total / 2 : cx;
+  const layer = (text, x, fill, shadow) => {
+    g.fillStyle = 'rgba(0,0,0,.35)'; g.fillText(text, x, cy + size * 0.11);
+    g.fillStyle = shadow; g.fillText(text, x, cy + size * 0.05);
+    g.lineWidth = size * 0.06; g.strokeStyle = 'rgba(20,16,40,.55)'; g.lineJoin = 'round'; g.strokeText(text, x, cy);
+    g.fillStyle = fill; g.fillText(text, x, cy);
+  };
+  layer(a, x0, '#ffffff', '#6f7393');
+  layer(b, x0 + wa, '#ffb627', '#b05a00');
+  g.restore();
+  return { x0, total };
+}
+
+function pill(g, text, cx, cy, size) {
+  g.save();
+  g.font = `800 ${size}px Rubik`;
+  g.textBaseline = 'middle';
+  const w = g.measureText(text).width + size * 1.6, h = size * 2;
+  g.fillStyle = 'rgba(11,13,24,.78)';
+  g.beginPath(); g.roundRect(cx - w / 2, cy - h / 2, w, h, h / 2); g.fill();
+  g.fillStyle = '#ffffff';
+  g.textAlign = 'center';
+  g.fillText(text, cx, cy + 1);
+  g.restore();
+}
+
+function vignette(g, w, h, strength = 0.45) {
+  const v = g.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.75);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, `rgba(5,6,16,${strength})`);
+  g.fillStyle = v; g.fillRect(0, 0, w, h);
+}
+
+async function save(name, c) {
+  await fetch(`/save?name=${name}`, { method: 'POST', body: c.toDataURL('image/png') });
+  const img = new Image(); img.src = c.toDataURL('image/png'); document.getElementById('out').append(img);
+}
+
+// ------------------------------------------------------------ framing helpers
+const yawTo = (x, z, tx, tz) => Math.atan2(-(tx - x), -(tz - z));
+const mix = (a, b, t) => a + Math.atan2(Math.sin(b - a), Math.cos(b - a)) * t;
+
+/** Open, flat ground around (x, z): every column in the box has the same height and nothing on top. */
+function flatAt(x, z, r) {
+  const y = topY(x, z);
+  for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) if (topY(x + dx, z + dz) !== y) return null;
+  return y;
+}
+
+/**
+ * A stage: a flat spot `dist` from the map centre, with the camera further out on the same line
+ * (so the middle of the map is the backdrop). Returns helpers to place fighters in camera space:
+ * at(right, depth) -> world position, and the camera.
+ */
+function stage(opts) {
+  // try the requested spot first, then nearby distances and smaller flat areas
+  for (const size of [opts.size, opts.size - 1, 2].filter((n, i, all) => n >= 2 && all.indexOf(n) === i)) {
+    for (const d of [0, -2, 2, -4, 4, -6]) {
+      const st = stageAt({ ...opts, dist: opts.dist + d, size });
+      if (st) return st;
+    }
+  }
+  throw new Error('no open spot');
+}
+
+function stageAt({ dist, camBack, camUp, lookUp = 1.2, size = 3, angle0 = 0 }) {
+  for (let k = 0; k < 72; k++) {
+    const a = angle0 + (k / 72) * Math.PI * 2;
+    const x = Math.floor(CX + Math.cos(a) * dist), z = Math.floor(CZ + Math.sin(a) * dist);
+    const y = flatAt(x, z, size);
+    if (y == null) continue;
+    const fx = (CX - x) / dist, fz = (CZ - z) / dist; // forward: toward the centre
+    const cx = x + 0.5 - fx * camBack, cz = z + 0.5 - fz * camBack;
+    if (flatAt(Math.floor(cx), Math.floor(cz), 1) == null || topY(Math.floor(cx), Math.floor(cz)) > y) continue;
+    const rx = -fz, rz = fx;
+    const at = (right, depth) => ({ x: x + 0.5 + rx * right + fx * depth, z: z + 0.5 + rz * right + fz * depth });
+    return { y, at, cam: { pos: [cx, y + camUp, cz], look: [x + 0.5, y + lookUp, z + 0.5] }, camXZ: { x: cx, z: cz } };
+  }
+  return null;
+}
+
+/** Two fighters squaring up, each turned partly toward the camera so their faces show. */
+function duel(st, a, b, { gap = 1.7, depth = 0, turn = 0.35 }) {
+  const pa = st.at(-gap / 2, depth), pb = st.at(gap / 2, depth);
+  fighter({ ...a, x: pa.x, z: pa.z, y: st.y + (a.lift || 0), face: mix(yawTo(pa.x, pa.z, pb.x, pb.z), yawTo(pa.x, pa.z, st.camXZ.x, st.camXZ.z), turn) });
+  fighter({ ...b, x: pb.x, z: pb.z, y: st.y + (b.lift || 0), face: mix(yawTo(pb.x, pb.z, pa.x, pa.z), yawTo(pb.x, pb.z, st.camXZ.x, st.camXZ.z), turn) });
+}
+
+function extra(st, opts, right, depth, faceCam = 0.5) {
+  const p = st.at(right, depth);
+  fighter({ ...opts, x: p.x, z: p.z, y: st.y + (opts.lift || 0), face: mix(yawTo(p.x, p.z, CX, CZ), yawTo(p.x, p.z, st.camXZ.x, st.camXZ.z), faceCam) });
+}
+
+function bottomShade(g, w, h, from = 0.65, alpha = 0.7) {
+  const grad = g.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(from, 'rgba(8,10,24,0)'); grad.addColorStop(1, `rgba(8,10,24,${alpha})`);
+  g.fillStyle = grad; g.fillRect(0, 0, w, h);
+}
+
+function topShade(g, w, h, upto = 0.38, alpha = 0.6) {
+  const grad = g.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, `rgba(8,10,24,${alpha})`); grad.addColorStop(upto, 'rgba(8,10,24,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, w, h);
+}
+
+// ------------------------------------------------------------ landscape 1920x1080: the arena
+generateWorld('arena'); buildAllChunks();
+{
+  const st = stage({ dist: 15, camBack: 6.2, camUp: 1.75, lookUp: 1.55, size: 4, angle0: 0.4 });
+  duel(st, { skin: 'knight', cape: 'titan', pose: 'swing' }, { skin: 'magma', cape: 'ember', pose: 'hit', lean: -0.15, lift: 0.2 }, { gap: 1.8, depth: 0 });
+  extra(st, { skin: 'astronaut', cape: 'starry', pose: 'run' }, -4.2, 3.5, 0.75);
+  extra(st, { skin: 'agent', cape: 'midnight', pose: 'bow', item: 'bow' }, 4.6, 4.5, 0.6);
+  extra(st, { skin: 'ivy', cape: 'rose', pose: 'block' }, 2.6, 7.5, 0.4);
+  const c = shot(1920, 1080, { ...st.cam, fov: 60 });
+  const g = c.getContext('2d');
+  bottomShade(g, 1920, 1080, 0.62, 0.72);
+  vignette(g, 1920, 1080, 0.38);
+  logo(g, 960, 930, 190);
+  await save('brickfall-landscape-1920x1080.png', c);
+}
+
+// ------------------------------------------------------------ portrait 800x1200: sumo on the floating ring
+clearModels();
+generateWorld('ring'); buildAllChunks();
+{
+  const y = 12, fx = 0, fz = -1; // look north across the ring
+  const sx = CX + 0.5, sz = CZ + 2.5;
+  const st = {
+    y,
+    at: (right, depth) => ({ x: sx + right * 1, z: sz + fz * depth }),
+    cam: { pos: [sx + 0.6, y + 2.0, sz + 5.2], look: [sx, y + 1.5, sz - 1] },
+    camXZ: { x: sx + 0.6, z: sz + 5.2 },
+  };
+  duel(st, { skin: 'captain', cape: 'hero', pose: 'swing', item: 'fists' }, { skin: 'rowan', cape: 'ocean', pose: 'hit', item: 'fists', lean: 0.2, lift: 0.35 }, { gap: 1.6, depth: 0, turn: 0.4 });
+  extra(st, { skin: 'frost', cape: 'checker', pose: 'run', item: 'fists' }, 2.8, 4.5, 0.6);
+  extra(st, { skin: 'shadow', cape: 'bolt', pose: 'block', item: 'fists' }, -3, 5.5, 0.5);
+  const c = shot(800, 1200, { ...st.cam, fov: 70 });
+  const g = c.getContext('2d');
+  topShade(g, 800, 1200, 0.3, 0.6);
+  const bot = g.createLinearGradient(0, 900, 0, 1200); bot.addColorStop(0, 'rgba(8,10,24,0)'); bot.addColorStop(1, 'rgba(8,10,24,.7)'); g.fillStyle = bot; g.fillRect(0, 900, 800, 300);
+  vignette(g, 800, 1200, 0.3);
+  logo(g, 400, 250, 118);
+  await save('brickfall-portrait-800x1200.png', c);
+}
+
+// ------------------------------------------------------------ square 800x800: a duel in the ruins
+clearModels();
+generateWorld('ruins'); buildAllChunks();
+{
+  const st = stage({ dist: 9, camBack: 4.6, camUp: 1.6, lookUp: 1.45, size: 3, angle0: 2.2 });
+  duel(st, { skin: 'titanking', cape: 'founder', pose: 'swing' }, { skin: 'circuit', cape: 'ace', pose: 'block' }, { gap: 1.7, depth: 0, turn: 0.4 });
+  extra(st, { skin: 'ranger', cape: 'midnight', pose: 'run' }, 3.2, 5, 0.6);
+  const c = shot(800, 800, { ...st.cam, fov: 62 });
+  const g = c.getContext('2d');
+  bottomShade(g, 800, 800, 0.7, 0.75);
+  vignette(g, 800, 800, 0.38);
+  logo(g, 400, 712, 104);
+  await save('brickfall-square-800x800.png', c);
+}
+document.getElementById('status').textContent = 'done';
+</script>
+</body></html>
