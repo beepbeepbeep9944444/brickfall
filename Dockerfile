@@ -10,9 +10,10 @@ COPY package.json ./
 COPY server ./server
 COPY public ./public
 
+# /data holds the SQLite database: mount a persistent volume there
+# (docker run -v brickfall-data:/data ..., or a Railway / Fly volume). No VOLUME line: Railway rejects it.
 RUN mkdir -p /data && chown -R node:node /data
 USER node
-VOLUME ["/data"]
 EXPOSE 8123
 
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:8123/healthz || exit 1
