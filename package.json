@@ -1,0 +1,19 @@
+{
+  "name": "brickfall",
+  "version": "0.8.0",
+  "private": true,
+  "description": "Brickfall: a block-built PvP arena that runs in the browser.",
+  "type": "module",
+  "main": "server/index.js",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch-path=server server/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test",
+    "rank": "node --disable-warning=ExperimentalWarning scripts/set-rank.js",
+    "coins": "node --disable-warning=ExperimentalWarning scripts/give-coins.js",
+    "build:crazygames": "node scripts/build-crazygames.js"
+  }
+}
